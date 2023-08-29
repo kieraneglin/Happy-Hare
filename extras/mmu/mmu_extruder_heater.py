@@ -56,7 +56,7 @@ class MmuExtruderHeater:
             # regardless of the MMU min temp. This ensures we're deffering to
             # the slicer if safe to do so.
             return self.stored_temp
+        elif self.get_target_temp() > self.klipper_minimum_extrude_temp:
+            return self.get_target_temp()
         else:
-            # If we've stored an unsafe temp OR no temp has been stored at all,
-            # use the greater of the current target temp or MMU min temp.
-            return max(self.get_target_temp(), self.mmu_minimum_extrude_temp)
+            return self.mmu_minimum_extrude_temp
