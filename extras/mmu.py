@@ -14,6 +14,7 @@
 #
 import logging, logging.handlers, threading, queue, time
 import textwrap, math, os.path, re, json
+from extras.mmu.mmu_extruder_heater import MmuExtruderHeater
 from random import randint
 import chelper
 
@@ -247,6 +248,8 @@ class Mmu:
         self.persistence_level = config.getint('persistence_level', 0, minval=0, maxval=4)
         self.auto_calibrate_gates = config.getint('auto_calibrate_gates', 0, minval=0, maxval=1)
         self.strict_filament_recovery = config.getint('strict_filament_recovery', 0, minval=0, maxval=1)
+
+        self.mmu_extruder_heater = MmuExtruderHeater(config, self.extruder_name)
 
         # Internal macro overrides
         self.pause_macro = config.get('pause_macro', 'PAUSE')
@@ -1831,8 +1834,8 @@ class Mmu:
 
     def _pause(self, reason, force_in_print=False):
         run_pause = False
-        if self.paused_extruder_temp == 0.: # Only save the initial pause temp
-            self.paused_extruder_temp = self.printer.lookup_object(self.extruder_name).heater.target_temp
+        self.mmu_extruder_heater.store_target_temp()
+
         if self._is_in_print() or force_in_print:
             if self.is_paused_locked: return
             self.is_paused_locked = True
@@ -2020,51 +2023,6 @@ class Mmu:
         finally:
             self._log_trace("Determined print status as: %s from %s" % (print_status, source))
             return print_status
-
-    def _ensure_safe_extruder_temperature(self, target_temp_override=-1, wait=False):
-        extruder_heater = self.printer.lookup_object(self.extruder_name).heater
-        current_temp = self.printer.lookup_object(self.extruder_name).get_status(0)['temperature']
-        current_target_temp = extruder_heater.target_temp
-        can_extrude = extruder_heater.can_extrude
-
-        # Determine correct target temp and hint as to where from to aid debugging
-        ensure_min = True
-        if target_temp_override > -1:
-            target_temp = target_temp_override
-            source = "specified"
-        elif self.is_paused_locked:
-            # During a pause/resume window always restore to paused temperature
-            target_temp = self.paused_extruder_temp
-            source = "paused"
-        elif self._is_in_print():
-            # During a print, we want to defer to the slicer for temperature
-            target_temp = current_target_temp
-            source = "slicer"
-            ensure_min = False
-        else:
-            # Standalone "just messing" case
-            target_temp = current_target_temp
-            source = "current"
-
-        if ensure_min and target_temp < self.min_temp_extruder:
-            target_temp = self.min_temp_extruder
-            source = "minimum"
-
-        if target_temp > current_target_temp:
-            if target_temp == self.min_temp_extruder:
-                # We use error channel to aviod heating surprise and will cause popup in Klipperscreen
-                self._log_error("Heating extruder to %s temp (%.1f)" % (source, target_temp))
-            else:
-                self._log_info("Heating extruder to %s temp (%.1f)" % (source, target_temp))
-        self.gcode.run_script_from_command("SET_HEATER_TEMPERATURE HEATER=extruder TARGET=%.1f" % target_temp)
-
-        # Optionally wait until temperature is stable or at minimum saftey temp and extruder can move
-        if wait or (ensure_min and current_temp < self.min_temp_extruder):
-            if abs(target_temp - current_temp) > 1:
-                current_action = self._set_action(self.ACTION_HEATING)
-                self._log_info("Waiting for extruder to reach target temperature (%.1f)" % target_temp)
-                self.gcode.run_script_from_command("TEMPERATURE_WAIT SENSOR=extruder MINIMUM=%.1f MAXIMUM=%.1f" % (target_temp - 1, target_temp + 1))
-                self._set_action(current_action)
 
     def _set_filament_pos(self, state, silent=False):
         self.filament_pos = state
@@ -2465,7 +2423,7 @@ class Mmu:
     # problem and indicate if we can unload the rest of the bowden more quickly
     def _check_filament_still_in_extruder(self):
         self._log_info("Checking for possibility of filament still in extruder gears...")
-        self._ensure_safe_extruder_temperature(wait=False)
+        self.mmu_extruder_heater.ensure_safe_extruder_temperature(self._get_print_status())
         self._servo_up()
         length = self.encoder_move_step_size
         delta = self._trace_filament_move("Checking extruder", -length, speed=self.extruder_unload_speed, motor="extruder")
@@ -2945,7 +2903,7 @@ class Mmu:
 
             # Important to wait for filaments with wildy different print temps. In practice, the time taken
             # to perform a swap should be adequate to reach the target temp but better safe than sorry
-            self._ensure_safe_extruder_temperature(wait=True)
+            self.mmu_extruder_heater.ensure_safe_extruder_temperature(self._get_print_status(), force_wait=True)
 
             if self._has_toolhead_sensor():
                 # With toolhead sensor we home to toolhead sensor past the extruder entrance
@@ -3146,7 +3104,7 @@ class Mmu:
         try:
             self._log_debug("Extracting filament from extruder")
             self._set_filament_direction(self.DIRECTION_UNLOAD)
-            self._ensure_safe_extruder_temperature(wait=False)
+            self.mmu_extruder_heater.ensure_safe_extruder_temperature(self._get_print_status())
             sync_allowed = self.toolhead_sync_unload and not extruder_stepper_only
             if sync_allowed:
                 self._servo_down()
@@ -3355,7 +3313,7 @@ class Mmu:
         current_action = self._set_action(self.ACTION_FORMING_TIP)
         try:
             self._log_info("Forming tip...")
-            self._ensure_safe_extruder_temperature(wait=False)
+            self.mmu_extruder_heater.ensure_safe_extruder_temperature(self._get_print_status())
             prev_sync_state = self._sync_gear_to_extruder(self.sync_form_tip and not extruder_stepper_only, servo=True)
 
             if self.extruder_tmc and self.extruder_form_tip_current > 100:
@@ -3841,7 +3799,7 @@ class Mmu:
                 return
 
         # Important to wait for stable temperature to resume exactly how we paused
-        self._ensure_safe_extruder_temperature(self.paused_extruder_temp, wait=True)
+        self.mmu_extruder_heater.ensure_safe_extruder_temperature(self._get_print_status(), use_stored_temp=True, force_wait=True)
         self.paused_extruder_temp = 0. # Reset so doesn't remain set when print is finished
         self.gcode.run_script_from_command("__RESUME")
         self._restore_toolhead_position()
